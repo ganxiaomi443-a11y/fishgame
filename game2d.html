@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no,viewport-fit=cover">
+<title>孤岛枪线</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;width:100%;overflow:hidden;background:#0b0f14}
+  canvas{display:block;position:fixed;left:0;top:0;width:100%;height:100%;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<script>
+(function(){
+"use strict";
+var cv=document.getElementById('cv');
+var ctx=cv.getContext('2d');
+var W=1,H=1;
+
+function fit(){
+  var w=Math.max(1,window.innerWidth),h=Math.max(1,window.innerHeight);
+  if(w===W&&h===H)return;
+  W=w;H=h;
+  cv.width=W;cv.height=H;
+}
+fit();
+window.addEventListener('resize',fit);
+window.addEventListener('orientationchange',function(){setTimeout(fit,240);});
+
+/* ====== 状态 ====== */
+var player,enemies,bullets,fx,state,ring,time,spawnT,score;
+var joy={on:false,id:null,bx:0,by:0,dx:0,dy:0};
+var fireId=null;
+var RSTICK=58,KNOB=24;
+var keys={};
+
+function reset(){
+  player={x:W/2,y:H/2+40,r:15,hp:100,alive:true,cd:0,ang:-Math.PI/2,kills:0};
+  enemies=[];bullets=[];fx=[];score=0;time=0;spawnT=0;
+  ring={r:Math.min(W,H)*0.78,target:Math.min(W,H)*0.78,cx:W/2,cy:H/2};
+  state='play';
+}
+
+function addEnemy(){
+  var a=Math.random()*6.283;
+  var rad=Math.max(W,H)*0.62;
+  var x=W/2+Math.cos(a)*rad,y=H/2+Math.sin(a)*rad;
+  enemies.push({x:Math.min(W-20,Math.max(20,x)),y:Math.min(H-20,Math.max(20,y)),
+    r:15,hp:40+time*0.6,alive:true,cd:1+Math.random(),ang:0,
+    sp:36+Math.random()*26,hit:0});
+}
+
+function shoot(x,y,ang,me,dmg){
+  bullets.push({x:x,y:y,vx:Math.cos(ang)*520,vy:Math.sin(ang)*520,life:1.6,me:me,dmg:dmg});
+  fx.push({x:x,y:y,t:0,k:'flash'});
+}
+
+/* ====== 输入 ====== */
+window.addEventListener('keydown',function(e){
+  keys[e.key.toLowerCase()]=1;
+  if(e.key===' ')e.preventDefault();
+  if((e.key==='r'||e.key==='R')&&state!=='play')reset();
+});
+window.addEventListener('keyup',function(e){keys[e.key.toLowerCase()]=0;});
+
+function pos(t){return {x:t.clientX,y:t.clientY};}
+
+cv.addEventListener('touchstart',function(e){
+  e.preventDefault();
+  for(var i=0;i<e.changedTouches.length;i++){
+    var t=e.changedTouches[i];
+    if(state!=='play'){reset();continue;}
+    if(t.clientX<W*0.5&&!joy.on){
+      joy.on=true;joy.id=t.identifier;joy.bx=t.clientX;joy.by=t.clientY;joy.dx=0;joy.dy=0;
+    }else if(t.clientX>=W*0.5&&fireId===null){
+      fireId=t.identifier;
+    }
+  }
+},{passive:false});
+
+cv.addEventListener('touchmove',function(e){
+  e.preventDefault();
+  for(var i=0;i<e.changedTouches.length;i++){
+    var t=e.changedTouches[i];
+    if(t.identifier===joy.id&&joy.on){
+      var dx=t.clientX-joy.bx,dy=t.clientY-joy.by;
+      var d=Math.hypot(dx,dy)||1;
+      var m=Math.min(d,RSTICK);
+      joy.dx=dx/d*(m/RSTICK);joy.dy=dy/d*(m/RSTICK);
+    }
+  }
+},{passive:false});
+
+function endTouch(e){
+  for(var i=0;i<e.changedTouches.length;i++){
+    var t=e.changedTouches[i];
+    if(t.identifier===joy.id){joy.on=false;joy.id=null;joy.dx=0;joy.dy=0;}
+    if(t.identifier===fireId)fireId=null;
+  }
+}
+cv.addEventListener('touchend',endTouch);
+cv.addEventListener('touchcancel',endTouch);
+
+cv.addEventListener('mousedown',function(e){
+  if(state!=='play'){reset();return;}
+  mouseDown=true;
+});
+window.addEventListener('mouseup',function(){mouseDown=false;});
+var mouseDown=false;
+
+/* ====== 逻辑 ====== */
+function nearest(){
+  var best=null,bd=1e9;
+  for(var i=0;i<enemies.length;i++){
+    var e=enemies[i];
+    if(!e.alive)continue;
+    var d=Math.hypot(e.x-player.x,e.y-player.y);
+    if(d<bd){bd=d;best=e;}
+  }
+  return best;
+}
+
+function update(dt){
+  time+=dt;
+  ring.r+=(ring.target-ring.r)*Math.min(1,dt*2);
+  if(time>6&&time%1<dt)ring.target=Math.max(70,ring.target-6);
+  ring.target=Math.max(70,Math.min(W,H)*0.78-time*2.2);
+
+  var dx=joy.dx,dy=joy.dy;
+  if(keys['a']||keys['arrowleft'])dx-=1;
+  if(keys['d']||keys['arrowright'])dx+=1;
+  if(keys['w']||keys['arrowup'])dy-=1;
+  if(keys['s']||keys['arrowdown'])dy+=1;
+  var l=Math.hypot(dx,dy);
+  if(l>0.1){
+    player.x+=dx/l*190*dt;player.y+=dy/l*190*dt;
+  }
+  player.x=Math.max(16,Math.min(W-16,player.x));
+  player.y=Math.max(16,Math.min(H-16,player.y));
+
+  spawnT-=dt;
+  if(spawnT<=0&&enemies.length<8){spawnT=1.2+Math.random();addEnemy();}
+
+  var near=nearest();
+  if(near){
+    player.ang=Math.atan2(near.y-player.y,near.x-player.x);
+  }
+
+  player.cd-=dt;
+  var wantFire=fireId!==null||mouseDown||keys[' '];
+  if(wantFire&&player.cd<=0&&near){
+    player.cd=0.16;
+    shoot(player.x,player.y,player.ang,true,26);
+  }
+
+  for(var i=0;i<enemies.length;i++){
+    var e=enemies[i];
+    if(!e.alive)continue;
+    e.hit=Math.max(0,e.hit-dt);
+    var ang=Math.atan2(player.y-e.y,player.x-e.x);
+    e.ang=ang;
+    var dd=Math.hypot(player.x-e.x,player.y-e.y);
+    if(dd>90){
+      e.x+=Math.cos(ang)*e.sp*dt;
+      e.y+=Math.sin(ang)*e.sp*dt;
+    }
+    e.cd-=dt;
+    if(e.cd<=0&&dd<W*0.55){
+      e.cd=1.3+Math.random();
+      shoot(e.x,e.y,ang,false,7);
+    }
+    // 出圈掉血
+    if(Math.hypot(e.x-ring.cx,e.y-ring.cy)>ring.r)e.hp-=dt*14;
+    if(e.hp<=0&&e.alive){e.alive=false;score+=100;player.kills++;}
+  }
+  enemies=enemies.filter(function(e){return e.alive;});
+
+  // 玩家出圈掉血
+  if(player.alive&&Math.hypot(player.x-ring.cx,player.y-ring.cy)>ring.r){
+    player.hp-=dt*7;
+    if(Math.random()<0.25)fx.push({x:player.x,y:player.y,t:0,k:'hurt'});
+    if(player.hp<=0){player.hp=0;player.alive=false;state='over';}
+  }
+
+  for(var b=0;b<bullets.length;b++){
+    var p=bullets[b];
+    p.x+=p.vx*dt;p.y+=p.vy*dt;p.life-=dt;
+    if(p.me){
+      for(var k=0;k<enemies.length;k++){
+        var e2=enemies[k];
+        if(!e2.alive)continue;
+        if(Math.hypot(p.x-e2.x,p.y-e2.y)<e2.r+5){
+          e2.hp-=p.dmg;e2.hit=0.12;p.life=0;
+          if(e2.hp<=0){e2.alive=false;score+=100;player.kills++;}
+          break;
+        }
+      }
+    }else if(player.alive&&Math.hypot(p.x-player.x,p.y-player.y)<player.r+5){
+      player.hp-=p.dmg;p.life=0;
+      fx.push({x:player.x,y:player.y,t:0,k:'hurt'});
+      if(player.hp<=0){player.hp=0;player.alive=false;state='over';}
+    }
+  }
+  bullets=bullets.filter(function(p){return p.life>0;});
+
+  for(var f=0;f<fx.length;f++)fx[f].t+=dt;
+  fx=fx.filter(function(f){return f.t<0.4;});
+}
+
+/* ====== 绘制 ====== */
+function circle(x,y,r,fill){ctx.fillStyle=fill;ctx.beginPath();ctx.arc(x,y,r,0,6.283);ctx.fill();}
+
+function drawPlayer(){
+  var x=player.x,y=player.y,r=player.r;
+  ctx.fillStyle='rgba(0,0,0,.3)';
+  ctx.beginPath();ctx.ellipse(x+2,y+5,r*1.05,r*0.72,0,0,6.283);ctx.fill();
+  ctx.save();ctx.translate(x,y);ctx.rotate(player.ang);
+  ctx.fillStyle='#123246';ctx.fillRect(r*0.3,-3.5,r*1.15,7);
+  circle(0,0,r,'#4fc3f7');
+  circle(r*0.42,0,r*0.4,'#0d2b3d');
+  circle(r*0.52,0,r*0.15,'#d7f2ff');
+  ctx.restore();
+  // 血条
+  ctx.fillStyle='rgba(0,0,0,.5)';ctx.fillRect(x-20,y-28,40,5);
+  ctx.fillStyle='#63d2ff';ctx.fillRect(x-20,y-28,40*Math.max(0,player.hp)/100,5);
+}
+
+function drawEnemy(e){
+  if(e.hit>0){circle(e.x,e.y,e.r+6,'rgba(255,120,140,.35)');}
+  var x=e.x,y=e.y,r=e.r;
+  ctx.save();ctx.translate(x,y);ctx.rotate(e.ang);
+  ctx.fillStyle='#3a1018';ctx.fillRect(r*0.3,-3,r*1.0,6);
+  circle(0,0,r,'#ff6b7d');
+  circle(r*0.42,0,r*0.4,'#2b1418');
+  circle(r*0.52,0,r*0.15,'#ffd0d8');
+  ctx.restore();
+}
+
+function draw(){
+  ctx.fillStyle='#0b0f14';
+  ctx.fillRect(0,0,W,H);
+
+  // 竞技场
+  ctx.save();
+  ctx.beginPath();ctx.arc(W/2,H/2,Math.max(W,H),0,6.283);ctx.clip();
+  ctx.fillStyle='#0f1720';
+  ctx.fillRect(0,0,W,H);
+  ctx.strokeStyle='#17222f';ctx.lineWidth=1;
+  for(var x=0;x<W;x+=64){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.stroke();}
+  for(var y=0;y<H;y+=64){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();}
+  ctx.restore();
+
+  // 毒圈
+  ctx.beginPath();ctx.arc(ring.cx,ring.cy,ring.r,0,6.283);
+  ctx.lineWidth=3;ctx.strokeStyle='rgba(255,90,110,.85)';ctx.stroke();
+
+  // 圈外红雾
+  ctx.save();
+  ctx.beginPath();ctx.rect(0,0,W,H);
+  ctx.arc(ring.cx,ring.cy,ring.r,0,6.283,true);
+  ctx.fillStyle='rgba(200,45,70,.13)';
+  ctx.fill('evenodd');
+  ctx.restore();
+
+  // 特效
+  for(var f=0;f<fx.length;f++){
+    var p=fx[f],k=f.t/0.4;
+    if(p.k==='flash'){
+      ctx.globalAlpha=Math.max(0,1-k*2.5);
+      circle(p.x,p.y,10*(1-k*2)+3,'#ffe9a8');
+    }else{
+      ctx.globalAlpha=Math.max(0,1-k*2.5);
+      ctx.strokeStyle='#ff5b6e';ctx.lineWidth=3;
+      ctx.beginPath();ctx.arc(p.x,p.y,18+k*14,0,6.283);ctx.stroke();
+    }
+    ctx.globalAlpha=1;
+  }
+
+  for(var i=0;i<enemies.length;i++)drawEnemy(enemies[i]);
+
+  // 子弹
+  ctx.lineWidth=3;ctx.lineCap='round';
+  for(var b=0;b<bullets.length;b++){
+    var q=bullets[b];
+    ctx.strokeStyle=q.me?'#9df3ff':'#ffb27a';
+    ctx.beginPath();ctx.moveTo(q.x,q.y);ctx.lineTo(q.x-q.vx*0.02,q.y-q.vy*0.02);ctx.stroke();
+  }
+
+  if(player.alive)drawPlayer();
+
+  // 摇杆
+  if(joy.on){
+    ctx.strokeStyle='rgba(120,210,255,.35)';ctx.lineWidth=2;
+    ctx.beginPath();ctx.arc(joy.bx,joy.by,RSTICK,0,6.283);ctx.stroke();
+    circle(joy.bx+joy.dx*RSTICK,joy.by+joy.dy*RSTICK,KNOB,'rgba(120,210,255,.55)');
+  }
+  // 开火键
+  var fxr=46,fxx=W-70,fyy=H-100;
+  circle(fxx,fyy,fxr,'rgba(255,90,110,.16)');
+  ctx.strokeStyle='rgba(255,120,140,.55)';ctx.lineWidth=2;
+  ctx.beginPath();ctx.arc(fxx,fyy,fxr,0,6.283);ctx.stroke();
+  ctx.fillStyle='rgba(255,200,210,.85)';ctx.font='13px system-ui,sans-serif';
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.fillText('开火',fxx,fyy);
+
+  // HUD
+  ctx.textAlign='left';ctx.textBaseline='top';
+  ctx.fillStyle='rgba(0,0,0,.42)';ctx.fillRect(10,10,150,58);
+  ctx.fillStyle='#e8f1ff';ctx.font='bold 15px system-ui,sans-serif';
+  ctx.fillText('HP '+Math.max(0,Math.round(player.hp)),20,18);
+  ctx.fillText('击杀 '+player.kills,20,40);
+
+  if(state==='idle')drawIdle();
+  if(state==='over')drawOver();
+}
+
+function drawIdle(){
+  ctx.fillStyle='rgba(5,8,12,.9)';ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.fillStyle='#8fe4ff';ctx.font='bold 26px system-ui,sans-serif';
+  ctx.fillText('孤 岛 枪 线',W/2,H/2-80);
+  ctx.fillStyle='#9db3c9';ctx.font='14px system-ui,sans-serif';
+  ctx.fillText('单屏大逃杀 · 自动瞄准最近敌人',W/2,H/2-38);
+  ctx.fillText('左边拖动 = 移动',W/2,H/2+2);
+  ctx.fillText('右边红色按钮 = 开火',W/2,H/2+28);
+  ctx.fillStyle='#5fd0ff';ctx.font='bold 16px system-ui,sans-serif';
+  ctx.fillText('点屏幕开始',W/2,H/2+96);
+}
+
+function drawOver(){
+  ctx.fillStyle='rgba(5,8,12,.86)';ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.fillStyle='#ff8090';ctx.font='bold 28px system-ui,sans-serif';
+  ctx.fillText('你被淘汰了',W/2,H/2-50);
+  ctx.fillStyle='#cfe3f5';ctx.font='15px system-ui,sans-serif';
+  ctx.fillText('击杀 '+player.kills+' · 得分 '+score,W/2,H/2-8);
+  ctx.fillStyle='#2f9ee8';
+  var bw=170,bh=48,bx=W/2-85,by=H/2+30;
+  ctx.beginPath();
+  if(ctx.roundRect){ctx.roundRect(bx,by,bw,bh,24);}else{ctx.rect(bx,by,bw,bh);}
+  ctx.fill();
+  ctx.fillStyle='#fff';ctx.font='bold 17px system-ui,sans-serif';
+  ctx.fillText('再来一局',W/2,by+bh/2);
+  ctx.fillStyle='rgba(160,190,215,.75)';ctx.font='12px system-ui,sans-serif';
+  ctx.fillText('点屏幕任意处',W/2,by+bh+26);
+}
+
+/* ====== 循环 ====== */
+var last=0,fpsAcc=0,fpsN=0,fps=0,err=null;
+function loop(t){
+  var dt=last?Math.min(0.05,(t-last)/1000):0.016;
+  last=t;
+  fpsAcc+=dt;fpsN++;
+  if(fpsAcc>0.5){fps=Math.round(fpsN/fpsAcc);fpsAcc=0;fpsN=0;}
+  try{
+    if(state==='play')update(dt);
+    draw();
+    ctx.fillStyle='rgba(255,255,255,.5)';
+    ctx.font='11px monospace';ctx.textAlign='right';ctx.textBaseline='top';
+    ctx.fillText('v10 fps='+fps,W-8,8);
+    ctx.textAlign='left';
+    ctx.fillStyle='rgba(255,255,255,.45)';
+    ctx.fillText('st='+state+' en='+enemies.length+' joy='+(joy.on?1:0)+' p='+Math.round(player.x)+','+Math.round(player.y)+' t='+time.toFixed(1),8,H-18);
+  }catch(e){
+    err=e.message;
+    ctx.fillStyle='#0b0f14';ctx.fillRect(0,0,W,H);
+    ctx.fillStyle='#ff8090';ctx.font='13px monospace';ctx.textAlign='left';
+    ctx.fillText('报错: '+err,14,20);
+  }
+  requestAnimationFrame(loop);
+}
+
+state='idle';
+player={x:W/2,y:H/2,r:15,hp:100,alive:true,cd:0,ang:0,kills:0};
+enemies=[];bullets=[];fx=[];score=0;time=0;spawnT=0;
+ring={r:Math.min(W,H)*0.78,target:Math.min(W,H)*0.78,cx:W/2,cy:H/2};
+requestAnimationFrame(loop);
+
+// 开场：任何点击/触摸即开始
+cv.addEventListener('touchstart',function(){if(state==='idle')reset();},{passive:true});
+cv.addEventListener('mousedown',function(){if(state==='idle')reset();});
+})();
+</script>
+</body>
+</html>

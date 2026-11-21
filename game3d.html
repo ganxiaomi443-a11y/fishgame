@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no,viewport-fit=cover">
+<title>深渊回廊 · 3D</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#07090c}
+  canvas{display:block;position:fixed;left:0;top:0;width:100%;height:100%;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<script>
+(function(){
+"use strict";
+var cv=document.getElementById('cv');
+var ctx=cv.getContext('2d',{alpha:false});
+var W=1,H=1;
+var ROT=0;
+function fit(){
+  var w=window.innerWidth|0,h=window.innerHeight|0;
+  if(w<2||h<2)return;
+  ROT=h>w?90:0;
+  if(ROT){W=h;H=w;}else{W=w;H=h;}
+  cv.width=W;cv.height=H;
+  if(ROT){
+    cv.style.width=W+'px';cv.style.height=H+'px';
+    cv.style.left='50%';cv.style.top='50%';
+    cv.style.transform='translate(-50%,-50%) rotate(90deg)';
+  }else{
+    cv.style.width='100%';cv.style.height='100%';
+    cv.style.left='0';cv.style.top='0';
+    cv.style.transform='none';
+  }
+}
+function toLocal(cx,cy){
+  if(!ROT)return {x:cx,y:cy};
+  return {x:W/2+(cy-window.innerHeight/2),y:H/2-(cx-window.innerWidth/2)};
+}
+fit();
+window.addEventListener('resize',fit);
+window.addEventListener('orientationchange',function(){setTimeout(fit,300);});
+
+/* ================= 地图 ================= */
+var MAP=[
+"11111111111111111111",
+"1..................1",
+"1..11....22....11..1",
+"1..11....22....11..1",
+"1..................1",
+"1....1111..1111....1",
+"1....1........1....1",
+"1....1..22....1....1",
+"1....1........1....1",
+"1....1111..1111....1",
+"1..................1",
+"1..1111......1111..1",
+"1..................1",
+"1........22........1",
+"1..................1",
+"11111111111111111111"];
+var MW=MAP[0].length,MH=MAP.length;
+
+function cell(x,y){
+  if(x<0||y<0||x>=MW||y>=MH)return 1;
+  var c=MAP[y].charAt(x);
+  return c==='.'?0:(c==='2'?2:1);
+}
+
+/* ================= 状态 ================= */
+var player,enemies,bullets,fx,state,time,score,spawned;
+var FOV=Math.PI/3;
+var DEPTH=new Float32Array(2048);
+var WEAPONS=[
+  {name:'手枪',dmg:20,rate:0.26,mag:12,reload:1.0,spread:0.012,zoom:1.25,auto:false,pellets:1,ammo:12,res:999},
+  {name:'步枪',dmg:24,rate:0.11,mag:30,reload:1.7,spread:0.03,zoom:2.4,auto:true,pellets:1,ammo:30,res:999},
+  {name:'霰弹枪',dmg:11,rate:0.78,mag:6,reload:2.2,spread:0.13,zoom:1.1,auto:false,pellets:6,ammo:6,res:999}
+];
+var wi=0,ads=false,reloading=0,fireCd=0;
+var joy={on:false,id:null,bx:0,by:0,dx:0,dy:0,move:0,strafe:0};
+var lookId=null,lookLast=0,fireHeld=false,fireId=null;
+var RS=54,KN=22;
+var WBTN=[];
+var gyro=false,lastGamma=null;
+window.addEventListener('deviceorientation',function(ev){
+  if(!gyro||!player||state!=='play')return;
+  var g=ev.gamma;
+  if(g===null||g===undefined)return;
+  if(lastGamma===null){lastGamma=g;return;}
+  var d=g-lastGamma;
+  if(Math.abs(d)<25)player.ang-=d*0.018;
+  lastGamma=g;
+});
+var keys={};
+
+function reset(){
+  player={x:2.5,y:2.5,ang:0.4,hp:100,alive:true,kills:0};
+  enemies=[];bullets=[];fx=[];time=0;score=0;spawned=0;
+  wi=0;ads=false;reloading=0;fireCd=0;
+  for(var i=0;i<WEAPONS.length;i++){WEAPONS[i].ammo=WEAPONS[i].mag;}
+  var pts=[[18.5,2.5],[2.5,14.5],[18.5,14.5],[10.5,2.5],[2.5,8.5],[18.5,8.5],[10.5,14.5],[6.5,6.5],[14.5,11.5]];
+  for(var k=0;k<pts.length;k++)spawnEnemy(pts[k][0],pts[k][1]);
+  state='play';
+}
+function spawnEnemy(x,y){
+  enemies.push({x:x,y:y,hp:70,alive:true,cd:1.5+Math.random()*2,ang:0,hit:0,
+    strafe:Math.random()<0.5?1:-1,strafeT:1+Math.random()*2,alert:false,dead:0});
+}
+
+/* ================= 工具 ================= */
+function los(x1,y1,x2,y2){
+  var dx=x2-x1,dy=y2-y1;
+  var d=Math.hypot(dx,dy);
+  var steps=Math.ceil(d*8);
+  for(var i=1;i<steps;i++){
+    var t=i/steps;
+    if(cell((x1+dx*t)|0,(y1+dy*t)|0))return false;
+  }
+  return true;
+}
+function dirDiff(a,b){
+  var d=a-b;
+  while(d>Math.PI)d-=Math.PI*2;
+  while(d<-Math.PI)d+=Math.PI*2;
+  return d;
+}
+
+/* ================= 输入 ================= */
+window.addEventListener('keydown',function(e){
+  keys[e.key.toLowerCase()]=1;
+  if(e.key===' ')e.preventDefault();
+  if(e.key==='1')wi=0;
+  if(e.key==='2')wi=1;
+  if(e.key==='3')wi=2;
+  if((e.key==='r'||e.key==='R')&&state!=='play')reset();
+  if(e.key==='f'||e.key==='F')ads=!ads;
+});
+window.addEventListener('keyup',function(e){keys[e.key.toLowerCase()]=0;});
+
+cv.addEventListener('mousedown',function(e){
+  if(state!=='play'){reset();return;}
+  if(e.clientX>W*0.72&&e.clientY>H*0.62)return;
+  fireHeld=true;
+});
+window.addEventListener('mouseup',function(){fireHeld=false;});
+cv.addEventListener('mousemove',function(e){
+  if(document.pointerLockElement!==cv)return;
+  player.ang+=e.movementX*0.0025;
+});
+
+cv.addEventListener('touchstart',function(e){
+  for(var i=0;i<e.changedTouches.length;i++){
+    var t=e.changedTouches[i];
+    var lp=toLocal(t.clientX,t.clientY);
+    if(state!=='play'){reset();break;}
+    // 陀螺仪开关
+    if(lp.x>=12&&lp.x<=90&&lp.y>=96&&lp.y<=126){gyro=!gyro;lastGamma=null;continue;}
+    // 武器切换
+    var hitW=false;
+    for(var b2=0;b2<WBTN.length;b2++){
+      var box=WBTN[b2];
+      if(lp.x>=box.x&&lp.x<=box.x+box.w&&lp.y>=box.y&&lp.y<=box.y+box.h){
+        wi=box.i;reloading=0;fireCd=0.2;hitW=true;break;
+      }
+    }
+    if(hitW)continue;
+    // 开火 / 开镜（圆形判定，避免误触）
+    var fcx=W-70,fcy=H-90,acx=W-70,acy=H-190;
+    if(Math.hypot(lp.x-fcx,lp.y-fcy)<58){fireHeld=true;fireId=t.identifier;continue;}
+    if(Math.hypot(lp.x-acx,lp.y-acy)<46){ads=!ads;continue;}
+    if(lp.x<W*0.42&&!joy.on){
+      joy.on=true;joy.id=t.identifier;joy.bx=lp.x;joy.by=lp.y;
+    }else{
+      lookId=t.identifier;lookLast=lp.x;
+    }
+  }
+  e.preventDefault();
+},{passive:false});
+
+cv.addEventListener('touchmove',function(e){
+  for(var i=0;i<e.changedTouches.length;i++){
+    var t=e.changedTouches[i];
+    var lp=toLocal(t.clientX,t.clientY);
+    if(t.identifier===joy.id&&joy.on){
+      var dx=lp.x-joy.bx,dy=lp.y-joy.by;
+      var d=Math.hypot(dx,dy)||1,m=Math.min(d,RS);
+      joy.move=-dy/d*(m/RS);
+      joy.strafe=dx/d*(m/RS);
+    }else if(t.identifier===lookId){
+      var ddx=lp.x-lookLast;
+      lookLast=lp.x;
+      player.ang+=ddx*0.008;
+    }
+  }
+  e.preventDefault();
+},{passive:false});
+
+function endT(e){
+  for(var i=0;i<e.changedTouches.length;i++){
+    var t=e.changedTouches[i];
+    if(t.identifier===joy.id){joy.on=false;joy.id=null;joy.move=0;joy.strafe=0;}
+    if(t.identifier===lookId)lookId=null;
+    if(t.identifier===fireId){fireId=null;fireHeld=false;}
+  }
+}
+cv.addEventListener('touchend',endT);
+cv.addEventListener('touchcancel',endT);
+
+/* ================= 逻辑 ================= */
+function tryMove(nx,ny){
+  if(!cell(nx|0,player.y|0))player.x=nx;
+  if(!cell(player.x|0,ny|0))player.y=ny;
+}
+
+function fire(){
+  var w=WEAPONS[wi];
+  if(fireCd>0||reloading>0)return;
+  if(w.ammo<=0){startReload();return;}
+  w.ammo--;
+  fireCd=w.rate;
+  if(w.auto===false&&!w.auto)fireHeld=false;
+
+  for(var p=0;p<w.pellets;p++){
+    var ang=player.ang+(Math.random()-0.5)*w.spread*2*(ads?0.45:1);
+    hitScan(ang,w.dmg);
+  }
+  fx.push({t:0,k:'muzzle'});
+}
+function hitScan(ang,dmg){
+  var best=null,bestD=1e9;
+  for(var i=0;i<enemies.length;i++){
+    var e=enemies[i];
+    if(!e.alive)continue;
+    var d=Math.hypot(e.x-player.x,e.y-player.y);
+    var a=Math.atan2(e.y-player.y,e.x-player.x);
+    var off=Math.abs(dirDiff(a,ang));
+    var hitR=Math.atan2(0.55,d); // 目标半径近似
+    if(off<hitR&&d<bestD&&los(player.x,player.y,e.x,e.y)){best=e;bestD=d;}
+  }
+  if(best){
+    var dmg2=dmg*(bestD>9?0.6:1);
+    best.hp-=dmg2;best.hit=0.16;best.alert=true;
+    if(best.hp<=0&&best.alive){best.alive=false;player.kills++;score+=100;}
+  }else{
+    fx.push({t:0,k:'spark',x:player.x+Math.cos(ang)*3,y:player.y+Math.sin(ang)*3});
+  }
+}
+function startReload(){
+  var w=WEAPONS[wi];
+  if(reloading>0||w.ammo===w.mag)return;
+  reloading=w.reload;
+}
+function update(dt){
+  time+=dt;
+  fireCd-=dt;
+  if(reloading>0){
+    reloading-=dt;
+    if(reloading<=0)WEAPONS[wi].ammo=WEAPONS[wi].mag;
+  }
+  if(fireHeld){
+    var w=WEAPONS[wi];
+    if(w.auto){fire();}
+    else if(fireCd<=0){fire();fireHeld=false;}
+  }
+  // 移动
+  var mv=0,st=0;
+  if(keys['w']||keys['arrowup'])mv+=1;
+  if(keys['s']||keys['arrowdown'])mv-=1;
+  if(keys['a'])st-=1;
+  if(keys['d'])st+=1;
+  mv+=joy.move;st+=joy.strafe;
+  var sp=(ads?1.6:3.2)*dt;
+  var mvl=Math.hypot(mv,st);
+  if(mvl>0.12){
+    var ca=Math.cos(player.ang),sa=Math.sin(player.ang);
+    tryMove(player.x+(ca*mv-sa*st)*sp,player.y+(sa*mv+ca*st)*sp);
+  }
+  // 瞄准偏移（键盘转向）
+  if(keys['arrowleft'])player.ang-=1.8*dt;
+  if(keys['arrowright'])player.ang+=1.8*dt;
+
+  // 敌人
+  for(var i=0;i<enemies.length;i++){
+    var e=enemies[i];
+    if(!e.alive){e.dead+=dt;continue;}
+    e.hit=Math.max(0,e.hit-dt);
+    e.cd-=dt;
+    e.strafeT-=dt;
+    if(e.strafeT<=0){e.strafe*=-1;e.strafeT=1.2+Math.random()*1.8;}
+    var d=Math.hypot(player.x-e.x,player.y-e.y);
+    var canSee=los(e.x,e.y,player.x,player.y)&&d<14;
+    if(canSee)e.alert=true;
+    e.ang=Math.atan2(player.y-e.y,player.x-e.x);
+    if(e.alert){
+      if(d>3.2){
+        var spd=(d>8?1.5:2.2)*dt;
+        var nx=e.x+Math.cos(e.ang)*spd,ny=e.y+Math.sin(e.ang)*spd;
+        if(!cell(nx|0,e.y|0))e.x=nx;
+        if(!cell(e.x|0,ny|0))e.y=ny;
+      }else if(d<2.0){
+        e.x-=Math.cos(e.ang)*1.2*dt;e.y-=Math.sin(e.ang)*1.2*dt;
+      }
+      // 侧移
+      var a2=e.ang+Math.PI/2*e.strafe;
+      var sx=e.x+Math.cos(a2)*1.4*dt,sy=e.y+Math.sin(a2)*1.4*dt;
+      if(!cell(sx|0,e.y|0)&&!cell(e.x|0,sy|0)){e.x=sx;e.y=sy;}
+      // 开火
+      if(canSee&&e.cd<=0&&d<12){
+        e.cd=1.0+Math.random()*1.4;
+        var acc=Math.max(0.08,0.5-d*0.02);
+        if(Math.random()<0.55+acc*0.5){
+          player.hp-=6+Math.random()*5;
+          fx.push({t:0,k:'hurt'});
+          if(player.hp<=0){player.hp=0;player.alive=false;state='over';}
+        }
+        fx.push({t:0,k:'enemyShot',x:e.x,y:e.y});
+      }
+    }
+  }
+  for(var f=0;f<fx.length;f++)fx[f].t+=dt;
+  fx=fx.filter(function(o){return o.t<0.5;});
+
+  // 胜利
+  var alive=0;
+  for(var k=0;k<enemies.length;k++)if(enemies[k].alive)alive++;
+  if(alive===0&&state==='play')state='win';
+}
+
+/* ================= 渲染 ================= */
+function shade(base,dist){
+  var f=Math.max(0.42,1-dist/22);
+  return 'rgb('+Math.round(base[0]*f)+','+Math.round(base[1]*f)+','+Math.round(base[2]*f)+')';
+}
+
+function drawSkyFish(){
+  // 天上飘过的大肥鱼剪影
+  var period=46;
+  var t=(time%period)/period;
+  var fx=W*1.25-t*W*1.55;
+  var fy=H*0.16+Math.sin(time*0.5)*8;
+  var s=Math.min(W,H)*0.055;
+  ctx.save();
+  ctx.globalAlpha=0.28;
+  ctx.fillStyle='#5fb8e8';
+  // 身体
+  ctx.beginPath();
+  ctx.ellipse(fx,fy,s*1.5,s,0,0,6.283);
+  ctx.fill();
+  // 尾巴
+  ctx.beginPath();
+  ctx.moveTo(fx-s*1.35,fy);
+  ctx.lineTo(fx-s*2.1,fy-s*0.75);
+  ctx.lineTo(fx-s*2.1,fy+s*0.75);
+  ctx.closePath();
+  ctx.fill();
+  // 眼
+  ctx.globalAlpha=0.5;
+  ctx.fillStyle='#0b1a26';
+  ctx.beginPath();ctx.arc(fx+s*0.85,fy-s*0.18,s*0.14,0,6.283);ctx.fill();
+  ctx.restore();
+}
+
+function drawFishIcon(x,y,r){
+  ctx.save();
+  ctx.translate(x,y);
+  ctx.fillStyle='#4fc3f7';
+  ctx.beginPath();ctx.ellipse(0,0,r*1.25,r,0,0,6.283);ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(-r*1.1,0);ctx.lineTo(-r*1.8,-r*0.7);ctx.lineTo(-r*1.8,r*0.7);
+  ctx.closePath();ctx.fill();
+  ctx.fillStyle='#0b2433';
+  ctx.beginPath();ctx.arc(r*0.7,-r*0.2,r*0.16,0,6.283);ctx.fill();
+  ctx.restore();
+}
+
+function render(){
+  // 天与地
+  var sky=ctx.createLinearGradient(0,0,0,H/2);
+  sky.addColorStop(0,'#1b3148');sky.addColorStop(1,'#2b4157');
+  ctx.fillStyle=sky;ctx.fillRect(0,0,W,H/2);
+  drawSkyFish();
+  var gnd=ctx.createLinearGradient(0,H/2,0,H);
+  gnd.addColorStop(0,'#39424c');gnd.addColorStop(1,'#1a222a');
+  ctx.fillStyle=gnd;ctx.fillRect(0,H/2,W,H/2);
+
+  var fov=ads?FOV/WEAPONS[wi].zoom:FOV;
+  var half=fov/2;
+  var cols=Math.min(W,1024);
+  var step=W/cols;
+  var horiz=H*0.5;
+
+  for(var i=0;i<cols;i++){
+    var x=i*step;
+    var ra=player.ang-half+fov*(i/cols);
+    var dx=Math.cos(ra),dy=Math.sin(ra);
+    // DDA
+    var mx=player.x|0,my=player.y|0;
+    var ddx=Math.abs(1/dx),ddy=Math.abs(1/dy);
+    var sx,sy,sdx,sdy;
+    if(dx<0){sx=-1;sdx=(player.x-mx)*ddx;}else{sx=1;sdx=(mx+1-player.x)*ddx;}
+    if(dy<0){sy=-1;sdy=(player.y-my)*ddy;}else{sy=1;sdy=(my+1-player.y)*ddy;}
+    var side=0,hitc=0,guard=0;
+    while(guard++<80){
+      if(sdx<sdy){sdx+=ddx;mx+=sx;side=0;}
+      else{sdy+=ddy;my+=sy;side=1;}
+      hitc=cell(mx,my);
+      if(hitc)break;
+    }
+    var pd=(side===0)?(sdx-ddx):(sdy-ddy);
+    if(pd<0.05)pd=0.05;
+    DEPTH[i]=pd;
+    var lh=Math.min(H*3,H/pd*0.95);
+    var y0=horiz-lh/2;
+    var c=[168,178,192];
+    if(hitc===2)c=[178,140,168];
+    var col=shade(c,pd*(side?1.12:1));
+    ctx.fillStyle=col;
+    ctx.fillRect(x,y0,step+1,lh);
+    // 砖缝
+    if(pd<7){
+      ctx.fillStyle='rgba(0,0,0,.18)';
+      ctx.fillRect(x,y0,step+1,Math.max(1,lh*0.02));
+      ctx.fillRect(x,y0+lh*0.5,step+1,Math.max(1,lh*0.015));
+    }
+  }
+
+  // 敌人（billboard + 深度测试）
+  var list=[];
+  for(var e2=0;e2<enemies.length;e2++){
+    var e=enemies[e2];
+    var ddx2=e.x-player.x,ddy2=e.y-player.y;
+    list.push({e:e,d:Math.hypot(ddx2,ddy2)});
+  }
+  list.sort(function(a,b){return b.d-a.d;});
+  for(var q=0;q<list.length;q++){
+    var it=list[q],en=it.e,dst=it.d;
+    if(dst<0.35||dst>16)continue;
+    var rel=dirDiff(Math.atan2(en.y-player.y,en.x-player.x),player.ang);
+    if(Math.abs(rel)>fov*0.75)continue;
+    var sx2=W/2+Math.tan(rel)*(W/2)/Math.tan(half);
+    var size=(H/dst)*0.75;
+    var ci=Math.round((sx2/W)*cols);
+    if(ci<0||ci>=cols)continue;
+    if(DEPTH[ci]<dst-0.25)continue;
+    var baseY=horiz+(H/(dst*2))*0.55;
+    var bodyH=size*0.95,bodyW=size*0.42;
+    if(en.alive){
+      ctx.fillStyle=en.hit>0?'#ffdfe4':'#d94b60';
+      ctx.fillRect(sx2-bodyW/2,baseY-bodyH,bodyW,bodyH);
+      ctx.fillStyle=en.hit>0?'#ffe9ec':'#f2a0ad';
+      ctx.beginPath();ctx.arc(sx2,baseY-bodyH-bodyW*0.42,bodyW*0.42,0,6.283);ctx.fill();
+      ctx.fillStyle='#201014';
+      ctx.fillRect(sx2-bodyW*0.34,baseY-bodyH-bodyW*0.5,bodyW*0.22,bodyW*0.14);
+      ctx.fillRect(sx2+bodyW*0.12,baseY-bodyH-bodyW*0.5,bodyW*0.22,bodyW*0.14);
+      // 血条
+      ctx.fillStyle='rgba(0,0,0,.55)';
+      ctx.fillRect(sx2-bodyW*0.7,baseY-bodyH-bodyW*1.1,bodyW*1.4,4);
+      ctx.fillStyle='#ff6b7d';
+      ctx.fillRect(sx2-bodyW*0.7,baseY-bodyH-bodyW*1.1,bodyW*1.4*Math.max(0,en.hp)/70,4);
+    }else if(en.dead<2.2){
+      ctx.globalAlpha=Math.max(0,1-en.dead/2.2);
+      ctx.fillStyle='#7a3040';
+      ctx.beginPath();ctx.ellipse(sx2,baseY,bodyW*0.9,bodyH*0.22,0,0,6.283);ctx.fill();
+      ctx.globalAlpha=1;
+    }
+  }
+
+  // 枪
+  drawGun();
+
+  // 特效（命中闪白）
+  for(var f2=0;f2<fx.length;f2++){
+    if(fx[f2].k==='hurt'){
+      ctx.fillStyle='rgba(255,60,80,'+(0.28*(1-fx[f2].t/0.5))+')';
+      ctx.fillRect(0,0,W,H);
+    }
+    if(fx[f2].k==='muzzle'){
+      ctx.fillStyle='rgba(255,236,170,'+(0.5*(1-fx[f2].t/0.12))+')';
+      ctx.fillRect(0,0,W,H);
+    }
+  }
+
+  // 开镜遮罩
+  if(ads)drawScope();
+
+  drawHUD();
+  if(state==='idle')drawIdle();
+  if(state==='over')drawOver();
+  if(state==='win')drawWin();
+}
+
+function drawGun(){
+  var w=WEAPONS[wi];
+  var bob=Math.sin(time*8)*3*Math.max(Math.abs(joy.move),Math.abs(joy.strafe));
+  var cx=W/2,cy=H;
+  if(ads)return; // 开镜时不显示枪
+  ctx.save();
+  ctx.translate(cx,cy+bob);
+  if(wi===0){
+    ctx.fillStyle='#2b333d';ctx.fillRect(-18,-120,36,110);
+    ctx.fillStyle='#3b4653';ctx.fillRect(-10,-150,20,40);
+  }else if(wi===1){
+    ctx.fillStyle='#26313c';ctx.fillRect(-26,-160,52,150);
+    ctx.fillStyle='#39485a';ctx.fillRect(-12,-200,24,50);
+    ctx.fillStyle='#1b242e';ctx.fillRect(-34,-120,14,60);
+  }else{
+    ctx.fillStyle='#33262a';ctx.fillRect(-30,-140,60,130);
+    ctx.fillStyle='#4a3238';ctx.fillRect(-40,-110,12,70);
+    ctx.fillStyle='#4a3238';ctx.fillRect(28,-110,12,70);
+  }
+  ctx.restore();
+}
+
+function drawScope(){
+  var r=Math.min(W,H)*0.34;
+  ctx.save();
+  ctx.fillStyle='rgba(0,0,0,.7)';
+  ctx.beginPath();
+  ctx.rect(0,0,W,H);
+  ctx.arc(W/2,H/2,r,0,6.283,true);
+  ctx.fill('evenodd');
+  ctx.strokeStyle='rgba(160,240,255,.9)';
+  ctx.lineWidth=2;
+  ctx.beginPath();ctx.arc(W/2,H/2,r,0,6.283);ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(W/2-r,H/2);ctx.lineTo(W/2+r,H/2);
+  ctx.moveTo(W/2,H/2-r);ctx.lineTo(W/2,H/2+r);
+  ctx.strokeStyle='rgba(140,220,255,.22)';ctx.stroke();
+  ctx.restore();
+}
+
+function drawHUD(){
+  var w=WEAPONS[wi];
+  ctx.textAlign='left';ctx.textBaseline='top';
+  ctx.fillStyle='rgba(0,0,0,.45)';
+  ctx.fillRect(10,10,168,74);
+  drawFishIcon(28,66,10);
+  ctx.fillStyle='#e8f1ff';ctx.font='bold 15px system-ui,sans-serif';
+  ctx.fillText('HP  '+Math.max(0,Math.round(player.hp)),52,18);
+  ctx.fillText(w.name+'  '+w.ammo+'/'+w.mag,20,40);
+  ctx.fillStyle='#8fb6cc';ctx.font='12px system-ui,sans-serif';
+  ctx.fillText('击杀 '+player.kills,20,62);
+
+  // 准星
+  ctx.strokeStyle='rgba(160,240,255,.85)';ctx.lineWidth=2;
+  ctx.beginPath();
+  ctx.moveTo(W/2-11,H/2);ctx.lineTo(W/2-4,H/2);
+  ctx.moveTo(W/2+4,H/2);ctx.lineTo(W/2+11,H/2);
+  ctx.moveTo(W/2,H/2-11);ctx.lineTo(W/2,H/2-4);
+  ctx.moveTo(W/2,H/2+4);ctx.lineTo(W/2,H/2+11);
+  ctx.stroke();
+
+  // 换弹提示
+  if(reloading>0){
+    ctx.fillStyle='rgba(255,220,120,.9)';ctx.font='bold 15px system-ui,sans-serif';
+    ctx.textAlign='center';
+    ctx.fillText('换弹中…',W/2,H*0.62);
+  }
+
+  // 按钮
+  var bx=W-70,by=H-90;
+  ctx.fillStyle='rgba(255,80,105,.18)';
+  ctx.beginPath();ctx.arc(bx,by,44,0,6.283);ctx.fill();
+  ctx.strokeStyle='rgba(255,120,140,.6)';ctx.lineWidth=2;ctx.stroke();
+  ctx.fillStyle='rgba(255,210,220,.9)';ctx.font='14px system-ui,sans-serif';
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.fillText('开火',bx,by);
+
+  ctx.fillStyle=ads?'rgba(120,210,255,.35)':'rgba(120,210,255,.14)';
+  ctx.beginPath();ctx.arc(W-70,H-190,32,0,6.283);ctx.fill();
+  ctx.strokeStyle='rgba(120,210,255,.55)';ctx.stroke();
+  ctx.fillStyle='rgba(210,240,255,.9)';ctx.font='12px system-ui,sans-serif';
+  ctx.fillText('开镜',W-70,H-190);
+
+  // 陀螺仪开关
+  ctx.fillStyle=gyro?'rgba(120,255,190,.28)':'rgba(255,255,255,.10)';
+  ctx.fillRect(12,96,78,30);
+  ctx.strokeStyle=gyro?'rgba(140,255,200,.8)':'rgba(255,255,255,.2)';
+  ctx.lineWidth=1.2;ctx.strokeRect(12,96,78,30);
+  ctx.fillStyle=gyro?'#d7ffee':'rgba(220,235,245,.7)';
+  ctx.font='12px system-ui,sans-serif';
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.fillText(gyro?'陀螺 开':'陀螺 关',51,111);
+
+  // 武器切换按钮
+  WBTN=[];
+  for(var wb=0;wb<WEAPONS.length;wb++){
+    var bw2=74,bh2=34;
+    var bx2=12+wb*(bw2+8),by2=H-46;
+    WBTN.push({x:bx2,y:by2,w:bw2,h:bh2,i:wb});
+    ctx.fillStyle=(wb===wi)?'rgba(79,195,247,.5)':'rgba(255,255,255,.10)';
+    ctx.fillRect(bx2,by2,bw2,bh2);
+    ctx.strokeStyle=(wb===wi)?'rgba(150,230,255,.9)':'rgba(255,255,255,.18)';
+    ctx.lineWidth=1.5;ctx.strokeRect(bx2,by2,bw2,bh2);
+    ctx.fillStyle=(wb===wi)?'#eaf9ff':'rgba(220,235,245,.75)';
+    ctx.font='12px system-ui,sans-serif';
+    ctx.textAlign='center';ctx.textBaseline='middle';
+    ctx.fillText(WEAPONS[wb].name,bx2+bw2/2,by2+bh2/2+1);
+  }
+
+  // 摇杆
+  if(joy.on){
+    ctx.strokeStyle='rgba(120,210,255,.3)';ctx.lineWidth=2;
+    ctx.beginPath();ctx.arc(joy.bx,joy.by,RS,0,6.283);ctx.stroke();
+    ctx.fillStyle='rgba(120,210,255,.5)';
+    ctx.beginPath();ctx.arc(joy.bx+joy.strafe*RS,joy.by-joy.move*RS,KN,0,6.283);ctx.fill();
+  }
+
+  // 小地图
+  var ms=5,mx0=W-ms*MW-12,my0=12;
+  ctx.fillStyle='rgba(0,0,0,.4)';ctx.fillRect(mx0-3,my0-3,ms*MW+6,ms*MH+6);
+  for(var y=0;y<MH;y++)for(var x=0;x<MW;x++){
+    var c=cell(x,y);
+    if(!c)continue;
+    ctx.fillStyle=c===2?'#7a5a70':'#3d4b5a';
+    ctx.fillRect(mx0+x*ms,my0+y*ms,ms-0.5,ms-0.5);
+  }
+  for(var k=0;k<enemies.length;k++){
+    var e=enemies[k];
+    if(!e.alive)continue;
+    ctx.fillStyle='#ff6b7d';
+    ctx.fillRect(mx0+e.x*ms-1,my0+e.y*ms-1,2.5,2.5);
+  }
+  ctx.fillStyle='#5fd0ff';
+  ctx.fillRect(mx0+player.x*ms-1.5,my0+player.y*ms-1.5,3,3);
+}
+
+function drawIdle(){
+  ctx.fillStyle='rgba(5,8,12,.9)';ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.fillStyle='#8fe4ff';ctx.font='bold 26px system-ui,sans-serif';
+  ctx.fillText('深 渊 回 廊',W/2,H/2-95);
+  ctx.fillStyle='#9db3c9';ctx.font='13px system-ui,sans-serif';
+  ctx.fillText('3D 第一人称 · 光线投射',W/2,H/2-58);
+  ctx.fillText('左半屏拖动 = 移动　右半屏滑动 = 转身',W/2,H/2-18);
+  ctx.fillText('右下 开火 / 开镜',W/2,H/2+8);
+  ctx.fillText('电脑：WASD 走路 · 方向键转身 · 空格开火 · F 开镜',W/2,H/2+34);
+  ctx.fillStyle='#5fd0ff';ctx.font='bold 16px system-ui,sans-serif';
+  ctx.fillText('点屏幕开始',W/2,H/2+96);
+}
+
+function drawOver(){
+  ctx.fillStyle='rgba(5,8,12,.86)';ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.fillStyle='#ff8090';ctx.font='bold 28px system-ui,sans-serif';
+  ctx.fillText('你倒下了',W/2,H/2-46);
+  ctx.fillStyle='#cfe3f5';ctx.font='15px system-ui,sans-serif';
+  ctx.fillText('击杀 '+player.kills+' · 得分 '+score,W/2,H/2-4);
+  ctx.fillStyle='rgba(160,190,215,.8)';ctx.font='13px system-ui,sans-serif';
+  ctx.fillText('点屏幕重来',W/2,H/2+44);
+}
+function drawWin(){
+  ctx.fillStyle='rgba(5,8,12,.86)';ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.fillStyle='#8ff0a8';ctx.font='bold 28px system-ui,sans-serif';
+  ctx.fillText('清场了',W/2,H/2-46);
+  ctx.fillStyle='#cfe3f5';ctx.font='15px system-ui,sans-serif';
+  ctx.fillText('击杀 '+player.kills+' · 用时 '+time.toFixed(1)+'s',W/2,H/2-4);
+  ctx.fillStyle='rgba(160,190,215,.8)';ctx.font='13px system-ui,sans-serif';
+  ctx.fillText('点屏幕再来',W/2,H/2+44);
+}
+
+/* ================= 主循环 ================= */
+var last=0,fpsAcc=0,fpsN=0,fpsShow=0,err=null;
+state='idle';
+player={x:2.5,y:2.5,ang:0.4,hp:100,alive:true,kills:0};
+enemies=[];bullets=[];fx=[];time=0;score=0;
+
+function loop(t){
+  var dt=last?Math.min(0.05,(t-last)/1000):0.016;
+  last=t;
+  fpsAcc+=dt;fpsN++;
+  if(fpsAcc>0.5){fpsShow=Math.round(fpsN/fpsAcc);fpsAcc=0;fpsN=0;}
+  try{
+    if(state==='play')update(dt);
+    render();
+  }catch(err2){
+    err=err2;
+    ctx.fillStyle='#0b0f14';ctx.fillRect(0,0,W,H);
+    ctx.fillStyle='#ff8090';ctx.font='13px monospace';ctx.textAlign='left';
+    ctx.fillText('报错: '+err2.message,14,20);
+  }
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
